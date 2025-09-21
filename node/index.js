@@ -792,8 +792,216 @@ const pollWithRetries = (
       });
   });
 
+// NEW ENDPOINT: Exchange public token for access token for frontend use
+app.post('/api/exchange_public_token', function (request, response, next) {
+  const publicToken = request.body.public_token;
+  
+  if (!publicToken) {
+    return response.status(400).json({ error: 'public_token is required' });
+  }
+  
+  Promise.resolve()
+    .then(async function () {
+      const tokenResponse = await client.itemPublicTokenExchange({
+        public_token: publicToken,
+      });
+      prettyPrintResponse(tokenResponse);
+      
+      // Store for this session (in production, use database)
+      ACCESS_TOKEN = tokenResponse.data.access_token;
+      ITEM_ID = tokenResponse.data.item_id;
+      
+      response.json({
+        access_token: tokenResponse.data.access_token,
+        item_id: tokenResponse.data.item_id,
+      });
+    })
+    .catch(next);
+});
+
+// NEW ENDPOINT: Fetch comprehensive financial data for Financial Disclosure
+app.post('/api/comprehensive_financial_data', function (request, response, next) {
+  const accessToken = request.body.access_token || ACCESS_TOKEN;
+  
+  if (!accessToken) {
+    return response.status(400).json({ error: 'access_token is required' });
+  }
+  
+  Promise.resolve()
+    .then(async function () {
+      console.log('Fetching comprehensive financial data...');
+      
+      // Fetch all data types in parallel
+      const [
+        accountsResponse,
+        identityResponse,
+        transactionsData,
+        balanceResponse,
+        liabilitiesResponse,
+        incomeResponse,
+        assetsResponse,
+      ] = await Promise.allSettled([
+        // Basic account info
+        client.accountsGet({ access_token: accessToken }),
+        
+        // Identity info
+        client.identityGet({ access_token: accessToken }),
+        
+        // Transactions (last 90 days)
+        (async () => {
+          const startDate = moment().subtract(90, 'days').format('YYYY-MM-DD');
+          const endDate = moment().format('YYYY-MM-DD');
+          
+          try {
+            // Use transactionsGet for comprehensive data
+            const response = await client.transactionsGet({
+              access_token: accessToken,
+              start_date: startDate,
+              end_date: endDate,
+            });
+            return response;
+          } catch (error) {
+            // If transactionsGet fails, try transactionsSync
+            console.log('transactionsGet failed, trying transactionsSync...');
+            let cursor = null;
+            let added = [];
+            let hasMore = true;
+            
+            while (hasMore) {
+              const syncResponse = await client.transactionsSync({
+                access_token: accessToken,
+                cursor: cursor,
+              });
+              
+              cursor = syncResponse.data.next_cursor;
+              if (cursor === "") {
+                await sleep(1000);
+                continue;
+              }
+              
+              added = added.concat(syncResponse.data.added);
+              hasMore = syncResponse.data.has_more;
+              
+              if (!hasMore || added.length > 100) break;
+            }
+            
+            return { data: { transactions: added, accounts: [], total: added.length } };
+          }
+        })(),
+        
+        // Account balances
+        client.accountsBalanceGet({ access_token: accessToken }),
+        
+        
+        // Liabilities (if available)
+        client.liabilitiesGet({ access_token: accessToken }).catch(err => {
+          console.log('Liabilities not available:', err.message);
+          // In sandbox, liabilities might not be available for all test accounts
+          // This is expected behavior - we'll handle it gracefully
+          if (err.response) {
+            console.log('Liabilities API error details:', err.response.data);
+          }
+          return null;
+        }),
+        
+        // Income verification (if available)
+        // Note: Income verification requires a separate flow in Plaid, not available via regular access token
+        Promise.resolve(null).then(() => {
+          console.log('Income verification requires separate flow, using transaction-based calculation');
+          return null;
+        }),
+        
+        // Assets (if available) - Note: Assets require a separate report generation flow
+        // For now, we'll use account balances as a proxy for assets
+        Promise.resolve(null),
+      ]);
+      
+      // Process results
+      const accounts = accountsResponse.status === 'fulfilled' ? accountsResponse.value.data.accounts : [];
+      const identity = identityResponse.status === 'fulfilled' && identityResponse.value.data.accounts[0]?.owners?.[0] 
+        ? identityResponse.value.data.accounts[0].owners[0]
+        : { addresses: [], emails: [], names: [], phone_numbers: [] };
+      const transactions = transactionsData.status === 'fulfilled' ? transactionsData.value.data.transactions : [];
+      const balances = balanceResponse.status === 'fulfilled' ? balanceResponse.value.data.accounts : [];
+      
+      
+      // Liabilities data
+      const liabilities = liabilitiesResponse && liabilitiesResponse.status === 'fulfilled' && liabilitiesResponse.value
+        ? {
+            credit: liabilitiesResponse.value.data.liabilities?.credit || [],
+            mortgage: liabilitiesResponse.value.data.liabilities?.mortgage || [],
+            student: liabilitiesResponse.value.data.liabilities?.student || [],
+          }
+        : null;
+      
+      // Use Income API data if available, otherwise calculate from transactions
+      let income;
+      if (incomeResponse && incomeResponse.status === 'fulfilled' && incomeResponse.value) {
+        // Use actual income data from Plaid Income API
+        income = incomeResponse.value.data;
+      } else {
+        // Fallback: Calculate income from transactions
+        const incomeTransactions = transactions.filter(t => 
+          t.amount < 0 && // Negative amounts are income in Plaid
+          (t.category?.includes('Deposit') || 
+           t.category?.includes('Transfer') || 
+           t.category?.includes('Payroll') ||
+           t.name?.toLowerCase().includes('payroll') ||
+           t.name?.toLowerCase().includes('salary'))
+        );
+        
+        const monthlyIncome = incomeTransactions.reduce((sum, t) => sum + Math.abs(t.amount), 0) / 3; // 3 months average
+        
+        income = {
+          projected_yearly_income: monthlyIncome * 12,
+          projected_yearly_income_before_tax: monthlyIncome * 12 * 1.25, // Estimate
+          income_streams: [{
+            name: 'Primary Income',
+            monthly_income: monthlyIncome,
+            confidence: 0.8,
+            days: 90,
+          }],
+          number_of_income_streams: 1,
+        };
+      }
+      
+      // Build comprehensive response
+      const comprehensiveData = {
+        accounts,
+        identity,
+        transactions,
+        balances,
+        income,
+        liabilities,
+        assets: null, // Asset reports require separate flow
+        summary: {
+          total_accounts: accounts.length,
+          total_transactions: transactions.length,
+          has_investments: false,
+          has_liabilities: !!liabilities,
+        },
+      };
+      
+      console.log('Comprehensive data fetched successfully');
+      response.json(comprehensiveData);
+    })
+    .catch(next);
+});
+
 app.use('/api', function (error, request, response, next) {
   console.log(error);
-  prettyPrintResponse(error.response);
-  response.json(formatError(error.response));
+  if (error.response) {
+    prettyPrintResponse(error.response);
+    response.json(formatError(error.response));
+  } else {
+    // Handle non-Plaid errors (like TypeErrors)
+    console.error('Non-Plaid error:', error.message);
+    response.status(500).json({
+      error: {
+        error_code: 'INTERNAL_ERROR',
+        error_message: error.message || 'An internal error occurred',
+        error_type: 'INTERNAL'
+      }
+    });
+  }
 });
